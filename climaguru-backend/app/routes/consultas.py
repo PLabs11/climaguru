@@ -12,8 +12,12 @@ from app.models.consulta import Consulta
 from app.models.dato_meteorologico import DatosClima
 from app.models.logs_actividad import LogsActividad
 from app.services.ideam_service import get_all_radares, get_radar_by_name
+from app.services.weather_service import WeatherAggregator
 
 consultas_bp = Blueprint('consultas', __name__)
+
+# Instancia global del agregador de clima
+aggregator = WeatherAggregator()
 
 
 @consultas_bp.route('/tiempo-real', methods=['POST'])
@@ -23,7 +27,7 @@ def consulta_tiempo_real():
     Realizar consulta de clima en tiempo real
     
     Body JSON:
-        - ciudad: string (opcional si se envían coordenadas)
+        - ciudad: string  (opcional si se envían coordenadas)
         - latitud: float (opcional si se envía ciudad)
         - longitud: float (opcional si se envía ciudad)
         - parametros: array de strings (temperatura, presion, viento, etc.)
@@ -44,7 +48,7 @@ def consulta_tiempo_real():
     
     # Crear registro de consulta
     consulta = Consulta(
-        usuario_id=usuario_id,
+        usuario_id=int(usuario_id),  # Convert string to int
         tipo_consulta='tiempo_real',
         ciudad=data.get('ciudad'),
         latitud=data.get('latitud'),
@@ -58,34 +62,28 @@ def consulta_tiempo_real():
     db.session.add(consulta)
     db.session.commit()
     
-    # TODO: Aquí se integrarían los clientes de las APIs externas
-    # Por ahora, simulamos una respuesta
-    
     try:
-        # Simular consulta a APIs externas
-        # En producción: climapi = ClimaAPIManager()
-        # datos = climapi.get_current_weather(lat, lon)
+        # Usar WeatherAggregator para obtener datos reales
+        result = aggregator.get_all_weather(
+            ciudad=data.get('ciudad', 'Bogota'),
+            lat=data.get('latitud'),
+            lon=data.get('longitud')
+        )
         
-        datos_simulados = {
-            'temperatura': 24.5,
-            'humedad': 65,
-            'presion': 1013,
-            'viento_velocidad': 12,
-            'viento_direccion': 180,
-            'descripcion': 'Parcialmente nublado'
-        }
+        # Extraer resumen para guardar en BD
+        resumen = result.get('resumen', {})
         
         # Guardar datos procesados
         datos_clima = DatosClima(
             consulta_id=consulta.id,
-            temperatura_promedio=datos_simulados['temperatura'],
-            humedad_relativa=datos_simulados['humedad'],
-            presion_atmosferica=datos_simulados['presion'],
-            velocidad_viento=datos_simulados['viento_velocidad'],
-            direccion_viento=datos_simulados['viento_direccion'],
-            descripcion_clima=datos_simulados['descripcion'],
-            fuentes_utilizadas=['openweather', 'openmeteo'],
-            datos_completos=datos_simulados
+            temperatura_promedio=resumen.get('temperatura'),
+            humedad_relativa=resumen.get('humedad'),
+            presion_atmosferica=resumen.get('presion'),
+            velocidad_viento=resumen.get('viento'),
+            direccion_viento=None,  # No disponible en resumen
+            descripcion_clima=resumen.get('descripcion'),
+            fuentes_utilizadas=list(result.get('fuentes', {}).keys()),
+            datos_completos=result
         )
         
         db.session.add(datos_clima)
@@ -93,33 +91,34 @@ def consulta_tiempo_real():
         # Actualizar consulta
         consulta.estado = 'completada'
         consulta.completada_en = datetime.utcnow()
-        consulta.tiempo_respuesta_ms = 500  # Simulado
+        consulta.tiempo_respuesta_ms = 500  # TODO: medir tiempo real
         
         db.session.commit()
         
         # Registrar log
         log = LogsActividad(
-            usuario_id=usuario_id,
+            usuario_id=int(usuario_id),
             accion='consulta_tiempo_real',
             detalle={
                 'consulta_id': consulta.id,
-                'ciudad': consulta.ciudad,
-                'coordenadas': f"{consulta.latitud}, {consulta.longitud}"
+                'ciudad': result.get('ciudad'),
+                'fuentes': result.get('total_fuentes')
             },
             ip_address=request.remote_addr
         )
         db.session.add(log)
         db.session.commit()
         
-        return jsonify({
-            'consulta': consulta.to_dict(),
-            'datos': datos_clima.to_dict()
-        }), 200
+        # Retornar resultado directamente del agregador
+        return jsonify(result), 200
         
     except Exception as e:
         consulta.estado = 'error'
         consulta.mensaje_error = str(e)
         db.session.commit()
+        
+        import traceback
+        traceback.print_exc()
         
         return jsonify({
             'error': 'Error al procesar la consulta',
